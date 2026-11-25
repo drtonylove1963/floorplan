@@ -683,11 +683,28 @@ function pyRoutes(src, f, out) {
   }
 }
 
+// A Fastify hook's code that turns callers away itself: it reads a credential (a header, token, session, key or
+// cookie) and replies 401 or 403.
+const REJECTS_CALLER = /\b(?:code|status)\s*\(\s*40[13]\b|\bstatusCode\s*=\s*40[13]\b/;
+const READS_CREDENTIAL = /\b(?:headers|authorization|token|session|api_?key|cookies?|auth)\b|[A-Z_]*TOKEN[A-Z_]*\b/i;
+const rejectsCaller = (code) => { const c = code.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' '); return REJECTS_CALLER.test(c) && READS_CREDENTIAL.test(c); };
+/** The text of the function that starts at `from` (up to its closing brace), or null. Bounded to 6,000 characters. */
+function callBody(src, from) {
+  const open = src.indexOf('{', from);
+  if (open < 0 || open - from > 400) return null;
+  let depth = 0;
+  for (let i = open; i < Math.min(src.length, open + 6000); i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0) return src.slice(from, i + 1);
+  }
+  return null;
+}
+
 function jsRoutes(src, f, out) {
   // route tables (keyed, listed, Bun.serve's) are checked by the dispatcher or inside the handler, where this can't
   // see; leaving them out also keeps them from cutting short the code read for the routes around them
   const routes = (f.routes || []).filter((r) => r.framework !== 'table');
-  if (!routes.length && !/\.use\(/.test(src) && !/(^|\/)middleware\.(t|j)s$/.test(f.path) && !/\bAPP_GUARD\b|\.useGlobalGuards\s*\(/.test(src)) return;
+  if (!routes.length && !/\.use\(/.test(src) && !/(^|\/)middleware\.(t|j)s$/.test(f.path) && !/\bAPP_GUARD\b|\.useGlobalGuards\s*\(|\.addHook\s*\(/.test(src)) return;
   const lines = src.split('\n');
   // NestJS: `{ provide: APP_GUARD, useClass: AuthGuard }` in a module, or `app.useGlobalGuards(new JwtAuthGuard())`
   // in main.ts, guards every Nest route of the app, except the ones a @Public()-style decorator opens. It turns
@@ -723,6 +740,30 @@ function jsRoutes(src, f, out) {
     if (name) uses.push({ v: m[1], line: lineOf(m.index), name });
   }
   for (const u of uses) if (u.v === 'app' || u.v === 'server') out.push({ k: 'global-guard', framework: 'express', name: u.name, line: u.line });
+  // Fastify: app.addHook('onRequest' | 'preValidation' | 'preHandler', hook) runs before every route on that app,
+  // often from a helper in another file (registerGuards(app) in security.ts). Like app.use(), it turns off the
+  // open-endpoint check for all of them, so the hook must show the check: a function whose name says so
+  // (verifyToken), or a hook body that reads a credential and turns the caller away with 401 or 403.
+  for (const m of src.matchAll(/(?<![\w$])([A-Za-z_$][\w$]*)\.addHook\(\s*["'`](onRequest|preValidation|preHandler)["'`]\s*,/g)) {
+    if (commented(m.index)) continue;
+    const args = callArgs(src, m.index + m[0].indexOf('(') + 1);
+    const hook = args?.[1]?.trim();
+    if (!hook) continue;
+    let ok = false, name = null;
+    if (/^(?:async\s+)?(?:function\b|\(|[A-Za-z_$][\w$]*\s*=>)/.test(hook)) ok = rejectsCaller(hook);
+    else {
+      name = useArgName(hook);
+      const bare = /^[A-Za-z_$][\w$]*$/.exec(hook)?.[0];
+      if (!name && bare) {
+        // a hook defined in this file: judge its body
+        const def = new RegExp(`(?:function\\s+${bare}\\s*\\(|(?:const|let|var)\\s+${bare}\\s*=)`).exec(src);
+        const body = def && callBody(src, def.index);
+        if (body && rejectsCaller(body)) name = bare;
+      }
+      ok = !!name;
+    }
+    if (ok) out.push({ k: 'global-guard', framework: 'fastify', name: name || `${m[2]} hook`, line: lineOf(m.index) });
+  }
 
   routes.forEach((r, idx) => {
     const rec = { k: 'route', line: r.line, method: r.method };
@@ -1978,7 +2019,7 @@ export function buildHealth({ graph, scan, arch, root }) {
     // an ASP.NET Core fallback policy guards its own project (the .csproj folder), and nothing else guards C# endpoints
     const csRoute = /\.cs$/.test(r.f);
     const global = (globalGuards.get(repo) || []).find((g) => ((g.framework === 'flask' || g.framework === 'fastapi') && /\.py$/.test(r.f))
-      || (g.framework === 'express' && !csRoute) || (g.framework === 'next' && !csRoute && fnd.fn === r.m)
+      || ((g.framework === 'express' || g.framework === 'fastify') && !csRoute) || (g.framework === 'next' && !csRoute && fnd.fn === r.m)
       || (g.framework === 'aspnet' && csRoute && cs.projectOf(g.file) === cs.projectOf(r.f))
       || (g.framework === 'nest' && fnd.nest && !fnd.nestPublic));
     // an unrecognised decorator that turns out to be an auth wrapper defined elsewhere in the project
