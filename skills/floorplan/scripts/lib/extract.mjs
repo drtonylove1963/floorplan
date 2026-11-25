@@ -368,7 +368,8 @@ function extractJs(src, filePath) {
     if (ROUTER_MAKER.test(callee.split('.').pop())) routerVars.add(m[1]);
     else if (!m[2] && !madeBy.has(m[1])) madeBy.set(m[1], callee);
   }
-  for (const m of all(/(?<![\w$])([A-Za-z_$][\w$]*)\.(get|post|put|patch|delete|all|options|head)\(\s*["'`](\/[^"'`]*)["'`]/g, code)) {
+  // Fastify and Express in TypeScript may give the route type parameters first: app.post<{ Body: Order }>('/orders', …)
+  for (const m of all(/(?<![\w$])([A-Za-z_$][\w$]*)\.(get|post|put|patch|delete|all|options|head)\s*(?:<[^()]{0,600}?>\s*)?\(\s*["'`](\/[^"'`]*)["'`]/g, code)) {
     if (!ROUTER_NAME.test(m[1]) && !routerVars.has(m[1])) continue;
     routes.push({ method: m[2].toUpperCase(), path: m[3], var: m[1], line: at(m.index) });
   }
@@ -459,6 +460,8 @@ function extractJs(src, filePath) {
   const dataAt = routes.length;
   routes.push(...dataRoutes(code, at, { handlerOf: tableHandler, serves: dataAt > 0 || routerVars.size > 0 || SERVES.test(code), skip: objectRoutes.map((o) => o[3]) }));
   for (const r of routes.slice(dataAt)) objectRoutes.push([r.line, r.line, r.path]);
+  // a route whose path sits on a line after the call (app.post<{ Body: … }>(\n  '/api/x', …)) isn't a request either
+  for (const r of routes.slice(0, dataAt)) if (r.var && !r.framework) objectRoutes.push([r.line, r.line + 3, r.path]);
 
   routes.push(...keyedRouteTable(code, at));
   if (/@nestjs\/common/.test(code) && /@Controller\s*\(/.test(code)) routes.push(...nestRoutes(code, at));
@@ -466,10 +469,10 @@ function extractJs(src, filePath) {
   const triggers = /firebase-functions/.test(code) ? firebaseFunctions(code, at, routes, mounts) : [];
 
   // a mount's prefix (including Fastify's `prefix: '/api'` option, often on a line of its own) isn't a request
-  const serverLine = /\b\w+\.(use|route)\(\s*["'`]\/|\b(?:app|server|fastify|hono|routes?|router|[a-z][\w$]*(?:Router|Routes))\.(?:get|post|put|patch|delete|all|options|head)\(\s*["'`]\/|\bprefix\s*:\s*["'`]\//;
+  const serverLine = /\b\w+\.(use|route)\(\s*["'`]\/|\b(?:app|server|fastify|hono|routes?|router|[a-z][\w$]*(?:Router|Routes))\.(?:get|post|put|patch|delete|all|options|head)\s*(?:<[^()]{0,600}?>\s*)?\(\s*["'`]\/|\bprefix\s*:\s*["'`]\//;
   // nor is a route on a router this file made, whatever it's called (frentes.get('/lista', …))
   const routeOnVar = routerVars.size && routes.some((r) => r.var && !ROUTER_NAME.test(r.var))
-    ? new RegExp(`(?<![\\w$])(?:${[...routerVars].slice(0, 200).map((v) => v.replace(/\$/g, '\\$')).join('|')})\\.(?:get|post|put|patch|delete|all|options|head)\\(\\s*["'\`]\\/`)
+    ? new RegExp(`(?<![\\w$])(?:${[...routerVars].slice(0, 200).map((v) => v.replace(/\$/g, '\\$')).join('|')})\\.(?:get|post|put|patch|delete|all|options|head)\\s*(?:<[^()]{0,600}?>\\s*)?\\(\\s*["'\`]\\/`)
     : null;
   const { calls, hosts } = extractCalls(code, at, { skip: routeOnVar ? { test: (line) => serverLine.test(line) || routeOnVar.test(line) } : serverLine });
   // a route object's own `url: '/api/x'` reads like a request (because of `url`), and so can a route listed as
